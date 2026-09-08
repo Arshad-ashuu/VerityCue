@@ -157,4 +157,4 @@ to **Apps → Manage your apps → Upload a custom app**, and in a meeting choos
 
 ---
 
-Built by **Mohammad Arshad** ([@Arshad-ashuu](https://github.com/Arshad-ashuu)).
+Built by **Mohammad Arshad [MOARSHAD]** ([@Arshad-ashuu](https://github.com/Arshad-ashuu)).
