@@ -154,3 +154,7 @@ to **Apps → Manage your apps → Upload a custom app**, and in a meeting choos
 - Tell people you are transcribing, per your local law and company policy.
 - Transcript text is kept in memory only and never written to disk.
 - Only you can see the panel.
+
+---
+
+Built by **Mohammad Arshad** ([@Arshad-0110](https://github.com/Arshad-0110)).
