@@ -3,7 +3,7 @@
   "manifestVersion": "1.17",
   "version": "1.0.0",
   "id": "5d6de114-2e0d-44db-8941-7090e69c681c",
-  "packageName": "com.contoso.copresenter",
+  "packageName": "com.contoso.veritycue",
   "developer": {
     "name": "Contoso",
     "websiteUrl": "https://{{HOSTNAME}}",
@@ -15,12 +15,12 @@
     "outline": "outline.png"
   },
   "name": {
-    "short": "Co-Presenter",
-    "full": "Co-Presenter — private AI co-presenter"
+    "short": "VerityCue",
+    "full": "VerityCue — private, grounded answer cues"
   },
   "description": {
     "short": "Detects customer questions live and suggests grounded answers.",
-    "full": "Co-Presenter listens to the meeting conversation, detects questions asked by customers, and privately suggests concise, grounded answers with talking points and sources. Only you see the panel."
+    "full": "VerityCue listens to the meeting conversation, detects questions asked by customers, and privately suggests concise, grounded answers with talking points and sources. Only you see the panel."
   },
   "accentColor": "#4F52B2",
   "configurableTabs": [

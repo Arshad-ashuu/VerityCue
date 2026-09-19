@@ -12,9 +12,9 @@ function ConfigPage() {
 
   return (
     <div className="app config">
-      <h1>Co-Presenter</h1>
+      <h1>VerityCue</h1>
       <p>
-        Co-Presenter listens to the meeting, spots customer questions and suggests concise,
+        VerityCue listens to the meeting, spots customer questions and suggests concise,
         grounded answers in your side panel. Only you can see them.
       </p>
       <p className="hint">Select Save to add it to this meeting.</p>

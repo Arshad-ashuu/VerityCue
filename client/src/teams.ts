@@ -38,9 +38,9 @@ export async function saveConfiguration(): Promise<void> {
   pages.config.registerOnSaveHandler((event) => {
     void pages.config
       .setConfig({
-        entityId: 'copresenter',
+        entityId: 'veritycue',
         contentUrl: `${window.location.origin}/`,
-        suggestedDisplayName: 'Co-Presenter',
+        suggestedDisplayName: 'VerityCue',
       })
       .then(() => event.notifySuccess());
   });

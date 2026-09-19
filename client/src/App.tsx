@@ -65,7 +65,7 @@ export function App() {
     <div className="app">
       <header className="top">
         <div>
-          <h1>Co-Presenter</h1>
+          <h1>VerityCue</h1>
           <span className="subtitle">
             {state === 'listening' ? 'Listening — only you can see this' : 'Private to you'}
           </span>

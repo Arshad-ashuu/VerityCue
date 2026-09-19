@@ -1,13 +1,29 @@
-# Co-Presenter — your private AI co-presenter
+# VerityCue
 
-Co-Presenter listens to a customer call, spots the questions being asked, and suggests
-short, grounded answers in a side panel that **only you** can see. It runs in a browser
-window next to Teams — no install, no admin approval.
+> Grounded answers, right on cue.
+
+VerityCue is a private AI meeting companion. It listens for customer questions, retrieves relevant facts, and streams concise, speakable answers
+into a panel that **only you** can see. Run it beside Microsoft Teams in Chrome or Edge,
+or install it as an optional Teams meeting app.
+
+## Highlights
+
+- **Live question detection** filters normal conversation and responds when a customer
+  asks something actionable.
+- **Grounded answers** search your own notes first, then official Microsoft Learn content.
+- **Fast streaming** lets you begin answering before the full suggestion is complete.
+- **Private guidance** keeps answer cards, talking points, sources, and transcripts visible
+  only to you.
+- **Flexible capture** supports meeting audio, your microphone, or both as separate streams.
+- **Azure-native AI** uses Azure OpenAI and Azure AI Speech with API key or Entra ID
+  authentication.
+
+## Example
 
 ```
 Customer:  "Why should we use Terraform instead of clicking through the Azure Portal?"
 
-Co-Presenter (private to you):
+VerityCue (private to you):
   Question   Why Terraform instead of the Azure Portal?
   Topic      comparison · Azure Infrastructure as Code
   Answer     Using Terraform means your infrastructure is stored as code, so changes
@@ -19,8 +35,8 @@ Co-Presenter (private to you):
   Source     Your notes · iac-terraform.md
 ```
 
-Answers start appearing about a second and a half after the question, and stream in
-word by word so you can start speaking before they finish.
+Answers typically begin appearing shortly after a question is detected and stream word by
+word, so you can start speaking before the response is complete.
 
 ## How it works
 
@@ -37,28 +53,117 @@ word by word so you can start speaking before they finish.
   (`gpt-4.1-nano`), a normal one for answers (`gpt-4.1-mini`), and an embedding model
   (`text-embedding-3-small`)
 - An **Azure AI Speech** resource
+- Access to invoke both Azure resources, using either API keys or an Entra ID account
 - **Chrome or Edge** — system audio capture is Chromium only
 
-## Setup (once)
+> Cloning or sharing this repository is not enough by itself. Each user also needs
+> access to the Azure resources above and a configured root `.env` file. The models
+> run in Azure; nothing needs to be downloaded or hosted locally.
+
+## Provision Azure automatically
+
+The included PowerShell script can create everything this app needs in Azure:
+
+- a resource group
+- an Azure OpenAI resource
+- an Azure AI Speech resource
+- `gpt-4.1-mini`, `gpt-4.1-nano`, and `text-embedding-3-small` deployments
+- a root `.env` file containing the resulting configuration
+
+You need an Azure subscription, Azure CLI, and permission to create resources, model
+deployments, and role assignments. Azure usage is billable and model availability and
+quota vary by subscription and region.
 
 ```powershell
-copy .env.example .env     # then fill in the values
-cd server; npm install; cd ..
-cd client; npm install; cd ..
-az login                   # the app signs in with Entra ID, no API keys needed
+# One-time Azure CLI setup
+winget install --exact --id Microsoft.AzureCLI
+az login
+az account list --output table
+
+# Run from the repository root with your subscription ID
+.\scripts\provision-azure.ps1 -SubscriptionId '<subscription-id>'
 ```
 
-## Run it
-
-Two terminals:
+The default region is `swedencentral`, deployment SKU is `GlobalStandard`, and
+authentication uses resource keys. Override settings when needed:
 
 ```powershell
-cd server; npm run dev     # http://localhost:3978
+.\scripts\provision-azure.ps1 `
+  -SubscriptionId '<subscription-id>' `
+  -Location 'eastus2' `
+  -ResourceGroup 'rg-my-veritycue' `
+  -Authentication EntraId
 ```
 
+With `-Authentication EntraId`, the script assigns the signed-in user the
+`Cognitive Services OpenAI User` and `Cognitive Services Speech User` roles. The user
+running it therefore also needs permission to create role assignments, such as Owner
+or User Access Administrator. Role assignments can take several minutes to propagate.
+
+The script validates that each model and the selected SKU are offered in the region.
+If Azure reports unavailable capacity or quota, choose another region/SKU or request
+quota in Azure. It reuses resources and deployments that already exist. If `.env`
+already exists, it preserves that file and writes the new values to `.env.generated`
+for review instead.
+
+## First-time setup
+
+1. Run the provisioning script above, manually provision the Azure OpenAI and Azure AI
+  Speech resources, or ask the resource owner to grant you access. The names in
+  `.env` must be the **deployment names** in Azure, which may differ from the
+  underlying model names.
+2. Create the local configuration file and fill in the Azure endpoint, deployment
+   names, Speech region, and one authentication method:
+
 ```powershell
-cd client; npm run dev     # http://localhost:5173
+Copy-Item .env.example .env
 ```
+
+- **API keys:** set `AZURE_OPENAI_API_KEY` and `AZURE_SPEECH_KEY`.
+- **Entra ID (keyless):** leave both key fields empty, set
+  `AZURE_SPEECH_RESOURCE_ID`, and sign in with `az login`. The account needs the
+  `Cognitive Services OpenAI User` role on the Azure OpenAI resource and equivalent
+  data-plane access to the Speech resource.
+
+Never commit or share `.env`; it is excluded by `.gitignore` because it may contain
+credentials.
+
+3. Install dependencies from the repository root:
+
+```powershell
+cd server
+npm install
+cd ..\client
+npm install
+cd ..
+```
+
+4. When using Entra ID authentication, sign in:
+
+```powershell
+az login
+```
+
+## Run it each time
+
+From the repository root, use two terminals and leave both running.
+
+Terminal 1 — backend:
+
+```powershell
+cd server
+npm run dev
+```
+
+Terminal 2 — frontend:
+
+```powershell
+cd client
+npm run dev
+```
+
+Then open **http://localhost:5173** in Chrome or Edge. The backend health endpoint is
+available at **http://localhost:3978/api/health**.
 
 ## Use it in a meeting
 
@@ -138,7 +243,7 @@ HTTPS with a tunnel (`devtunnel host -p 5173 --allow-anonymous`), put that host 
 into `appPackage/manifest.json` in place of every `{{HOSTNAME}}`, add the tunnel
 origin to `ALLOWED_ORIGINS` in `.env`, zip the `appPackage` folder, then in Teams go
 to **Apps → Manage your apps → Upload a custom app**, and in a meeting choose
-**+ Add an app → Co-Presenter**.
+**+ Add an app → VerityCue**.
 
 ## Project layout
 

@@ -11,9 +11,9 @@ Before zipping:
 4. Zip the **contents** of this folder (not the folder itself):
 
 ```powershell
-Compress-Archive -Path .\manifest.json,.\color.png,.\outline.png -DestinationPath .\build\copresenter.zip -Force
+Compress-Archive -Path .\manifest.json,.\color.png,.\outline.png -DestinationPath .\build\veritycue.zip -Force
 ```
 
 5. Teams → **Apps → Manage your apps → Upload a custom app** → pick the zip.
-6. In a meeting: **+ Add an app → Co-Presenter → Save**, then open it from the
+6. In a meeting: **+ Add an app → VerityCue → Save**, then open it from the
    meeting toolbar to get the side panel.
