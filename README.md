@@ -6,6 +6,8 @@ VerityCue is a private AI meeting companion. It listens for customer questions, 
 into a panel that **only you** can see. Run it beside Microsoft Teams in Chrome or Edge,
 or install it as an optional Teams meeting app.
 
+![alt text](<Screenshot 2026-10-01 104029.png>)
+
 ## Highlights
 
 - **Live question detection** filters normal conversation and responds when a customer
