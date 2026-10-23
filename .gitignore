@@ -4,3 +4,4 @@ dist/
 .env.generated
 *.local
 appPackage/build/
+client/public/speech/

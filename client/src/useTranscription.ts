@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import * as SpeechSDK from 'microsoft-cognitiveservices-speech-sdk';
 import { getSpeechToken } from './api';
+import { createSpeechCapture, type SpeechCapture } from './speechCapture';
 
 export type Speaker = 'me' | 'customer';
 
@@ -22,109 +22,117 @@ export type ListeningState = 'idle' | 'starting' | 'listening' | 'error';
 /** Auth tokens last 10 minutes; refresh comfortably inside that. */
 const TOKEN_REFRESH_MS = 8 * 60 * 1000;
 
-interface Source {
-  recognizer: SpeechSDK.SpeechRecognizer;
-  config: SpeechSDK.SpeechConfig;
-  stream: MediaStream;
+interface ListeningSession {
+  streams: MediaStream[];
+  captures: SpeechCapture[];
+  refresh: number | null;
+}
+
+function releaseSession(session: ListeningSession): void {
+  if (session.refresh !== null) window.clearInterval(session.refresh);
+  for (const stream of session.streams) {
+    stream.getTracks().forEach((track) => track.stop());
+  }
+  for (const capture of session.captures) {
+    void capture.close().catch((error) => console.error('[speech] cleanup failed', error));
+  }
 }
 
 export function useTranscription(onLine: (line: Line) => void) {
   const [state, setState] = useState<ListeningState>('idle');
   const [error, setError] = useState<string | null>(null);
 
-  const sourcesRef = useRef<Source[]>([]);
-  const refreshRef = useRef<number | null>(null);
+  const sessionRef = useRef<ListeningSession | null>(null);
   // Keeps the callback fresh without restarting the recognizers on every render.
   const onLineRef = useRef(onLine);
   onLineRef.current = onLine;
 
   const stop = useCallback(() => {
-    if (refreshRef.current) {
-      window.clearInterval(refreshRef.current);
-      refreshRef.current = null;
-    }
-    for (const source of sourcesRef.current) {
-      source.recognizer.stopContinuousRecognitionAsync(
-        () => source.recognizer.close(),
-        () => undefined,
-      );
-      source.stream.getTracks().forEach((track) => track.stop());
-    }
-    sourcesRef.current = [];
+    const session = sessionRef.current;
+    sessionRef.current = null;
+    if (session) releaseSession(session);
     setState('idle');
   }, []);
 
   const start = useCallback(
     async (mode: CaptureMode) => {
+      if (sessionRef.current) return;
+      const session: ListeningSession = { streams: [], captures: [], refresh: null };
+      sessionRef.current = session;
       setError(null);
       setState('starting');
+
+      const fail = (caught: unknown) => {
+        if (sessionRef.current !== session) return;
+        sessionRef.current = null;
+        releaseSession(session);
+        setError(caught instanceof Error ? caught.message : 'Could not start listening');
+        setState('error');
+      };
+
+      const addStream = (stream: MediaStream) => {
+        if (sessionRef.current !== session) {
+          stream.getTracks().forEach((track) => track.stop());
+          return false;
+        }
+        session.streams.push(stream);
+        stream.getAudioTracks()[0]?.addEventListener('ended', () => {
+          if (sessionRef.current === session) stop();
+        });
+        return true;
+      };
 
       try {
         const wanted: { speaker: Speaker; stream: MediaStream }[] = [];
 
         if (mode === 'system' || mode === 'both') {
-          wanted.push({ speaker: 'customer', stream: await captureSystemAudio() });
+          const stream = await captureSystemAudio();
+          if (!addStream(stream)) return;
+          wanted.push({ speaker: 'customer', stream });
         }
         if (mode === 'mic' || mode === 'both') {
-          wanted.push({
-            speaker: 'me',
-            stream: await navigator.mediaDevices.getUserMedia({ audio: true }),
+          const stream = await navigator.mediaDevices.getUserMedia({
+            audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
           });
+          if (!addStream(stream)) return;
+          wanted.push({ speaker: 'me', stream });
         }
 
         const { token, region } = await getSpeechToken();
+        if (sessionRef.current !== session) return;
 
         for (const { speaker, stream } of wanted) {
-          const config = SpeechSDK.SpeechConfig.fromAuthorizationToken(token, region);
-          config.speechRecognitionLanguage = 'en-US';
-
-          const recognizer = new SpeechSDK.SpeechRecognizer(
-            config,
-            SpeechSDK.AudioConfig.fromStreamInput(stream),
-          );
-
-          // Only final results — partials would spam the analyzer.
-          recognizer.recognized = (_sender, event) => {
-            const text = event.result.text?.trim();
-            if (!text || event.result.reason !== SpeechSDK.ResultReason.RecognizedSpeech) return;
-            onLineRef.current({ id: event.result.resultId, speaker, text, at: Date.now() });
-          };
-
-          recognizer.canceled = (_sender, event) => {
-            if (event.reason === SpeechSDK.CancellationReason.Error) {
-              setError(event.errorDetails || 'Transcription was cancelled');
-              setState('error');
-            }
-          };
-
-          // Fires when the user clicks the browser's "Stop sharing" bar.
-          stream.getAudioTracks()[0]?.addEventListener('ended', () => stop());
-
-          await new Promise<void>((resolve, reject) => {
-            recognizer.startContinuousRecognitionAsync(
-              () => resolve(),
-              (e) => reject(new Error(String(e))),
-            );
+          const capture = await createSpeechCapture({
+            token,
+            region,
+            stream,
+            onTranscript: (id, text) => {
+              if (sessionRef.current === session) {
+                onLineRef.current({ id, speaker, text, at: Date.now() });
+              }
+            },
+            onError: fail,
           });
-
-          sourcesRef.current.push({ recognizer, config, stream });
+          if (sessionRef.current !== session) {
+            await capture.close();
+            return;
+          }
+          session.captures.push(capture);
         }
 
         setState('listening');
 
-        refreshRef.current = window.setInterval(async () => {
+        session.refresh = window.setInterval(async () => {
           try {
             const refreshed = await getSpeechToken();
-            for (const source of sourcesRef.current) {
-              source.config.authorizationToken = refreshed.token;
-            }
-          } catch {
-            /* a genuine failure surfaces as a cancellation on the next result */
+            if (sessionRef.current !== session) return;
+            for (const capture of session.captures) capture.updateToken(refreshed.token);
+          } catch (caught) {
+            fail(caught);
           }
         }, TOKEN_REFRESH_MS);
       } catch (caught) {
-        setError(caught instanceof Error ? caught.message : 'Could not start listening');
-        setState('error');
+        fail(caught);
       }
     },
     [stop],

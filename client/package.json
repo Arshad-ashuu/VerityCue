@@ -4,13 +4,18 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "predev": "node scripts/prepare-speech-assets.mjs",
     "dev": "vite",
+    "prebuild": "node scripts/prepare-speech-assets.mjs",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "tsx --test tests/*.test.ts"
   },
   "dependencies": {
     "@microsoft/teams-js": "^2.56.0",
+    "@ricky0123/vad-web": "0.0.31",
     "microsoft-cognitiveservices-speech-sdk": "^1.51.0",
+    "onnxruntime-web": "^1.17.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },
@@ -19,6 +24,7 @@
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^6.1.1",
+    "tsx": "^4.23.13",
     "typescript": "^5.9.3",
     "vite": "^8.2.2"
   }

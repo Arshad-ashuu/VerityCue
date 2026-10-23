@@ -1,224 +1,445 @@
+#requires -Version 5.1
+<#
+.SYNOPSIS
+Installs Azure CLI if needed, signs in, and provisions VerityCue using Entra ID only.
+.DESCRIPTION
+Uses the subscription selected by az login unless SubscriptionId is supplied.
+Discovers supported regions, model versions, deployment SKUs, and available quota.
+Prints the exact Azure environment settings and preserves any existing .env file.
+Azure resource creation and usage can incur charges. Installation may require elevation.
+#>
 [CmdletBinding()]
 param(
-  [Parameter(Mandatory)]
   [string]$SubscriptionId,
-
-  [string]$Location = 'swedencentral',
+  [string]$TenantId,
+  [switch]$UseDeviceCode,
+  [string]$Location,
+  [string]$SpeechLocation,
+  [ValidateNotNullOrEmpty()]
   [string]$ResourceGroup = 'rg-veritycue',
   [string]$OpenAIAccountName,
   [string]$SpeechAccountName,
-  [ValidateSet('Keys', 'EntraId')]
-  [string]$Authentication = 'Keys',
+  [ValidateSet('EntraId')]
+  [string]$Authentication = 'EntraId',
+  [ValidateNotNullOrEmpty()]
+  [string]$ChatModel = 'gpt-4.1-mini',
+  [ValidateNotNullOrEmpty()]
+  [string]$DetectModel = 'gpt-4.1-nano',
+  [ValidateNotNullOrEmpty()]
+  [string]$EmbeddingModel = 'text-embedding-3-small',
+  [string]$ChatDeploymentName,
+  [string]$DetectDeploymentName,
+  [string]$EmbeddingDeploymentName,
   [ValidateSet('Standard', 'GlobalStandard', 'DataZoneStandard')]
-  [string]$DeploymentSku = 'GlobalStandard',
-  [ValidateRange(1, 1000)]
-  [int]$ChatCapacity = 10,
-  [ValidateRange(1, 1000)]
-  [int]$DetectCapacity = 10,
-  [ValidateRange(1, 1000)]
-  [int]$EmbeddingCapacity = 10
+  [string]$DeploymentSku,
+  [ValidateSet('Standard', 'GlobalStandard', 'DataZoneStandard')]
+  [string]$EmbeddingDeploymentSku,
+  [ValidateRange(0, 1000)]
+  [int]$ChatCapacity = 0,
+  [ValidateRange(0, 1000)]
+  [int]$DetectCapacity = 0,
+  [ValidateRange(0, 1000)]
+  [int]$EmbeddingCapacity = 0
 )
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
+if ($Location) { $Location = ($Location -replace '\s', '').ToLowerInvariant() }
+if ($SpeechLocation) { $SpeechLocation = ($SpeechLocation -replace '\s', '').ToLowerInvariant() }
+
+function Install-AzureCliIfMissing {
+  if (Get-Command az -ErrorAction SilentlyContinue) { return }
+
+  Write-Host 'Azure CLI was not found. Installing it (administrator approval may be required)...'
+  if (Get-Command winget -ErrorAction SilentlyContinue) {
+    & winget install --exact --id Microsoft.AzureCLI --source winget `
+      --accept-package-agreements --accept-source-agreements --silent --disable-interactivity
+    if ($LASTEXITCODE -ne 0) {
+      throw "Azure CLI installation failed (winget exit code $LASTEXITCODE). Install from https://aka.ms/installazurecliwindows and rerun."
+    }
+  }
+  else {
+    if ($env:OS -ne 'Windows_NT') {
+      throw 'Automatic Azure CLI installation requires Windows. See https://learn.microsoft.com/cli/azure/install-azure-cli.'
+    }
+    $installer = Join-Path ([IO.Path]::GetTempPath()) "veritycue-azure-cli-$([guid]::NewGuid().ToString('N')).msi"
+    $installerUrl = 'https://aka.ms/installazurecliwindows'
+    if ([Environment]::Is64BitOperatingSystem) { $installerUrl += 'x64' }
+    try {
+      Invoke-WebRequest -Uri $installerUrl -OutFile $installer -UseBasicParsing
+      $process = Start-Process -FilePath msiexec.exe -Verb RunAs -Wait -PassThru `
+        -ArgumentList @('/i', "`"$installer`"", '/passive', '/norestart')
+      if ($process.ExitCode -notin @(0, 3010)) {
+        throw "Azure CLI installation failed (MSI exit code $($process.ExitCode))."
+      }
+    }
+    finally {
+      if (Test-Path -LiteralPath $installer) { Remove-Item -LiteralPath $installer }
+    }
+  }
+
+  $paths = @(
+    $env:Path
+    [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    [Environment]::GetEnvironmentVariable('Path', 'User')
+    foreach ($programFiles in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+      if ($programFiles) {
+        $bin = Join-Path $programFiles 'Microsoft SDKs\Azure\CLI2\wbin'
+        if (Test-Path -LiteralPath (Join-Path $bin 'az.cmd')) { $bin }
+      }
+    }
+  )
+  $env:Path = ($paths | Where-Object { $_ }) -join [IO.Path]::PathSeparator
+  if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+    throw 'Azure CLI installation finished but az is still unavailable. Restart the terminal (or Windows if requested) and rerun.'
+  }
+}
 
 function Invoke-Az {
   param([Parameter(ValueFromRemainingArguments)][string[]]$Arguments)
 
-  $output = & az @Arguments 2>&1
+  if ($SubscriptionId -and $Arguments[0] -in @('provider', 'group', 'cognitiveservices', 'resource', 'role')) {
+    $Arguments += @('--subscription', $SubscriptionId)
+  }
+  # Windows PowerShell can turn redirected native stderr into terminating errors.
+  $ErrorActionPreference = 'Continue'
+  $PSNativeCommandUseErrorActionPreference = $false
+  $output = & az @Arguments --only-show-errors 2>&1
   if ($LASTEXITCODE -ne 0) {
     throw "az $($Arguments -join ' ') failed:`n$($output -join "`n")"
   }
-  return $output
+  return ($output -join "`n").Trim()
 }
 
-function Test-AzResource {
-  param([string[]]$Arguments)
+function Invoke-AzJson {
+  param([Parameter(ValueFromRemainingArguments)][string[]]$Arguments)
 
-  & az @Arguments --only-show-errors 1>$null 2>$null
-  return $LASTEXITCODE -eq 0
-}
-
-function Get-ModelVersion {
-  param([string]$ModelName)
-
-  $catalogJson = Invoke-Az cognitiveservices model list `
-    --location $Location `
-    --subscription $SubscriptionId `
-    --output json `
-    --only-show-errors
-  $catalog = ($catalogJson -join "`n") | ConvertFrom-Json
-  $candidates = @($catalog | Where-Object {
-      $_.model.name -eq $ModelName -and
-      $_.model.format -eq 'OpenAI' -and
-      ($_.model.skus.name -contains $DeploymentSku)
-    })
-
-  if ($candidates.Count -eq 0) {
-    throw "Model '$ModelName' with SKU '$DeploymentSku' is unavailable in '$Location'. Choose another -Location or -DeploymentSku."
+  $json = Invoke-Az @Arguments --output json
+  if (-not $json) { throw "az $($Arguments -join ' ') returned no JSON." }
+  try {
+    return ConvertFrom-Json -InputObject $json -ErrorAction Stop
   }
-
-  return ($candidates.model.version | Sort-Object -Descending | Select-Object -First 1)
+  catch {
+    throw "Invalid JSON from az $($Arguments -join ' '): $($_.Exception.Message)"
+  }
 }
 
-function Deploy-Model {
-  param(
-    [string]$DeploymentName,
-    [string]$ModelName,
-    [int]$Capacity
+function Get-ServiceLocation {
+  param([string]$Kind)
+
+  $skus = @(Invoke-AzJson cognitiveservices account list-skus --kind $Kind)
+  $regions = @(
+    foreach ($sku in $skus | Where-Object name -eq 'S0') {
+      foreach ($region in $sku.locations) {
+        $blocked = @($sku.restrictions | Where-Object {
+            $_.type -eq 'Location' -and ($_.values -contains $region)
+          })
+        if ($blocked.Count -eq 0 -and $region -ne 'global') {
+          ($region -replace '\s', '').ToLowerInvariant()
+        }
+      }
+    }
   )
+  if ($regions.Count -eq 0) { throw "Azure reports no available S0 regions for '$Kind' in this subscription." }
+  return $regions | Sort-Object -Unique
+}
 
-  if (Test-AzResource @('cognitiveservices', 'account', 'deployment', 'show', '--resource-group', $ResourceGroup, '--name', $OpenAIAccountName, '--deployment-name', $DeploymentName)) {
-    Write-Host "Model deployment '$DeploymentName' already exists."
-    return
+function Get-ExistingAccount {
+  param([string]$Kind, [string]$Name)
+
+  $found = @($accounts | Where-Object {
+      if ($Name) { $_.name -eq $Name } else { $_.kind -eq $Kind }
+    })
+  if ($found.Count -gt 1) {
+    throw "Multiple '$Kind' accounts exist in '$ResourceGroup'. Specify -OpenAIAccountName or -SpeechAccountName."
+  }
+  if ($found.Count -eq 1) {
+    if ($found[0].kind -ne $Kind) { throw "Account '$Name' has kind '$($found[0].kind)', not '$Kind'." }
+    return $found[0]
+  }
+}
+
+function Get-DeploymentPlan {
+  param([string]$Region)
+
+  $items = [System.Collections.Generic.List[object]]::new()
+  $missing = @()
+  foreach ($requirement in $requirements) {
+    $existing = @($deployments | Where-Object name -eq $requirement.Name)
+    if ($existing.Count -eq 0) { $missing += $requirement; continue }
+    $deployment = $existing[0]
+    if ($deployment.properties.model.name -ne $requirement.Model -or $deployment.properties.model.format -ne 'OpenAI') {
+      throw "Deployment '$($requirement.Name)' uses a different model. Choose another deployment name or the matching -ChatModel/-DetectModel/-EmbeddingModel."
+    }
+    if ($deployment.properties.provisioningState -ne 'Succeeded') {
+      throw "Deployment '$($requirement.Name)' is not ready: $($deployment.properties.provisioningState)."
+    }
+    if (($requirement.Sku -and $deployment.sku.name -ne $requirement.Sku) -or
+        ($requirement.Capacity -gt 0 -and $deployment.sku.capacity -ne $requirement.Capacity)) {
+      throw "Deployment '$($requirement.Name)' has a different SKU or capacity. Existing deployments are not resized; update it in Azure or choose a different deployment name."
+    }
+    $items.Add([pscustomobject]@{ Requirement = $requirement; Existing = $deployment })
+  }
+  if ($missing.Count -eq 0) { return [pscustomobject]@{ Ready = $true; Items = $items } }
+
+  $catalog = @(Invoke-AzJson cognitiveservices model list --location $Region)
+  $usages = @(Invoke-AzJson cognitiveservices usage list --location $Region)
+  $remaining = @{}
+  foreach ($usage in $usages) {
+    $remaining[$usage.name.value] = [double]$usage.limit - [double]$usage.currentValue
   }
 
-  $version = Get-ModelVersion $ModelName
-  Write-Host "Deploying $ModelName version $version as '$DeploymentName'..."
-  Invoke-Az cognitiveservices account deployment create `
-    --resource-group $ResourceGroup `
-    --name $OpenAIAccountName `
-    --deployment-name $DeploymentName `
-    --model-name $ModelName `
-    --model-version $version `
-    --model-format OpenAI `
-    --sku-name $DeploymentSku `
-    --sku-capacity $Capacity `
-    --only-show-errors `
-    --output none
+  foreach ($requirement in $missing) {
+    $models = @($catalog | Where-Object {
+        $_.model.name -eq $requirement.Model -and $_.model.format -eq 'OpenAI' -and
+        $_.model.lifecycleStatus -notin @('Deprecated', 'Disabled') -and
+        (-not $_.model.deprecation.inference -or [datetimeoffset]$_.model.deprecation.inference -gt [datetimeoffset]::UtcNow)
+      } | ForEach-Object { $_.model } | Sort-Object `
+        @{ Expression = { $_.isDefaultVersion -eq $true }; Descending = $true }, `
+        @{ Expression = { [regex]::Replace($_.version, '\d+', { param($match) $match.Value.PadLeft(12, '0') }) }; Descending = $true })
+
+    $preferredSkus = @('GlobalStandard', 'Standard', 'DataZoneStandard')
+    if ($requirement.Sku) { $preferredSkus = @($requirement.Sku) }
+    $selected = $null
+    foreach ($model in $models) {
+      foreach ($skuName in $preferredSkus) {
+        $sku = $model.skus | Where-Object name -eq $skuName | Select-Object -First 1
+        if (-not $sku -or -not $remaining.ContainsKey($sku.usageName)) { continue }
+        $minimum = [Math]::Max(1, [int]$sku.capacity.minimum)
+        $step = [Math]::Max(1, [int]$sku.capacity.step)
+        $capacity = $minimum
+        if ($requirement.Capacity -gt 0) { $capacity = $requirement.Capacity }
+        if ($capacity -lt $minimum -or ($capacity - $minimum) % $step -ne 0) { continue }
+        if ($sku.capacity.maximum -and $capacity -gt $sku.capacity.maximum) { continue }
+        if ($remaining[$sku.usageName] -lt $capacity) { continue }
+        $selected = [pscustomobject]@{
+          Requirement = $requirement
+          Existing = $null
+          Version = $model.version
+          Sku = $skuName
+          Capacity = $capacity
+        }
+        $remaining[$sku.usageName] -= $capacity
+        break
+      }
+      if ($selected) { break }
+    }
+    if (-not $selected) {
+      return [pscustomobject]@{
+        Ready = $false
+        Reason = "'$($requirement.Model)' has no supported version/SKU with sufficient reported quota for the requested capacity."
+      }
+    }
+    $items.Add($selected)
+  }
+  return [pscustomobject]@{ Ready = $true; Items = $items }
+}
+
+function Initialize-AiAccount {
+  param([string]$Name, [string]$Kind, [string]$Region, $Existing)
+
+  $resource = $Existing
+  if (-not $resource) {
+    Write-Host "Creating $Kind account '$Name' in '$Region'..."
+    $resource = Invoke-AzJson cognitiveservices account create `
+      --resource-group $ResourceGroup --name $Name --location $Region `
+      --kind $Kind --sku S0 --custom-domain $Name --yes
+    if (-not $resource.id) { throw "Azure returned no resource ID for '$Name'." }
+    Invoke-Az resource update --ids $resource.id --set properties.disableLocalAuth=true --output none
+  }
+  elseif (-not $resource.properties.customSubDomainName) {
+    Write-Host "Configuring the custom subdomain required by Entra ID on '$Name'..."
+    $resource = Invoke-AzJson cognitiveservices account update `
+      --resource-group $ResourceGroup --name $Name --custom-domain $Name
+  }
+  if (-not $resource.id -or -not $resource.location -or $resource.properties.provisioningState -ne 'Succeeded') {
+    throw "Account '$Name' is not ready. Inspect its provisioning state in Azure before rerunning."
+  }
+  return $resource
 }
 
 function Grant-RoleIfMissing {
-  param(
-    [string]$PrincipalId,
-    [string]$Role,
-    [string]$Scope
-  )
+  param([string]$Role, [string]$Scope)
 
-  $assignmentId = (Invoke-Az role assignment list `
-      --assignee $PrincipalId `
-      --role $Role `
-      --scope $Scope `
-      --query '[0].id' `
-      --output tsv `
-      --only-show-errors).Trim()
-  if ($assignmentId) {
+  $assignments = @(Invoke-AzJson role assignment list --assignee-object-id $principalId `
+      --fill-principal-name false --role $Role --scope $Scope --include-inherited)
+  if ($assignments.Count -gt 0) {
     Write-Host "Role '$Role' is already assigned."
     return
   }
-
-  Invoke-Az role assignment create `
-    --assignee-object-id $PrincipalId `
-    --assignee-principal-type User `
-    --role $Role `
-    --scope $Scope `
-    --output none `
-    --only-show-errors
+  Write-Host "Assigning '$Role' to the signed-in user..."
+  Invoke-Az role assignment create --assignee-object-id $principalId `
+    --assignee-principal-type User --role $Role --scope $Scope --output none
 }
 
-if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
-  throw 'Azure CLI is required. Install it from https://aka.ms/installazurecliwindows and run az login.'
-}
+Install-AzureCliIfMissing
+Write-Host 'Signing in to Azure with Microsoft Entra ID...'
+$loginArguments = @('login', '--output', 'none')
+if ($TenantId) { $loginArguments += @('--tenant', $TenantId) }
+if ($UseDeviceCode) { $loginArguments += '--use-device-code' }
+Invoke-Az @loginArguments
+if ($SubscriptionId) { Invoke-Az account set --subscription $SubscriptionId --output none }
+$account = Invoke-AzJson account show
+if (-not $account.id -or -not $account.tenantId) { throw 'az account show returned no subscription or tenant ID.' }
+if ($account.state -ne 'Enabled') { throw "Subscription '$($account.name)' is not enabled: $($account.state)." }
+$SubscriptionId = $account.id
+if ($account.user.type -ne 'user') { throw 'This local setup requires an interactive user login. Run az login with your Entra account.' }
+$principal = Invoke-AzJson ad signed-in-user show
+$principalId = $principal.id
+if (-not $principalId) { throw 'Could not determine the signed-in Entra user object ID.' }
 
-$account = & az account show --output json --only-show-errors 2>$null
-if ($LASTEXITCODE -ne 0) {
-  throw 'Not signed in to Azure. Run az login, then run this script again.'
-}
-
-Invoke-Az account set --subscription $SubscriptionId
-$subscriptionSuffix = ($SubscriptionId -replace '-', '').Substring(0, 8).ToLowerInvariant()
-if (-not $OpenAIAccountName) { $OpenAIAccountName = "veritycue-ai-$subscriptionSuffix" }
-if (-not $SpeechAccountName) { $SpeechAccountName = "veritycue-speech-$subscriptionSuffix" }
-
+Write-Host "Subscription: $($account.name) ($SubscriptionId)"
+Write-Host "Tenant:       $($account.tenantId)"
+Write-Host "Authentication: $Authentication only. Resource keys will not be retrieved."
+Write-Host 'This app needs Azure OpenAI and Speech; no separate Foundry project or hub is required.'
 Write-Host 'Registering Microsoft.CognitiveServices...'
-Invoke-Az provider register --namespace Microsoft.CognitiveServices --wait --only-show-errors
+Invoke-Az provider register --namespace Microsoft.CognitiveServices --wait --output none
 
-if (-not (Test-AzResource @('group', 'show', '--name', $ResourceGroup))) {
-  Write-Host "Creating resource group '$ResourceGroup' in '$Location'..."
-  Invoke-Az group create --name $ResourceGroup --location $Location --output none --only-show-errors
+$groups = @(Invoke-AzJson group list)
+$group = $groups | Where-Object name -eq $ResourceGroup | Select-Object -First 1
+$accounts = @()
+if ($group) { $accounts = @(Invoke-AzJson cognitiveservices account list --resource-group $ResourceGroup) }
+$openAi = Get-ExistingAccount -Kind OpenAI -Name $OpenAIAccountName
+$speech = Get-ExistingAccount -Kind SpeechServices -Name $SpeechAccountName
+$hash = [Security.Cryptography.SHA256]::Create()
+try {
+  $suffix = ([BitConverter]::ToString($hash.ComputeHash(
+        [Text.Encoding]::UTF8.GetBytes("$SubscriptionId/$($ResourceGroup.ToLowerInvariant())")
+      )) -replace '-', '').Substring(0, 10).ToLowerInvariant()
+}
+finally { $hash.Dispose() }
+if ($openAi) { $OpenAIAccountName = $openAi.name }
+elseif (-not $OpenAIAccountName) { $OpenAIAccountName = "veritycue-ai-$suffix" }
+if ($speech) { $SpeechAccountName = $speech.name }
+elseif (-not $SpeechAccountName) { $SpeechAccountName = "veritycue-speech-$suffix" }
+if (-not $ChatDeploymentName) { $ChatDeploymentName = $ChatModel }
+if (-not $DetectDeploymentName) { $DetectDeploymentName = $DetectModel }
+if (-not $EmbeddingDeploymentName) { $EmbeddingDeploymentName = $EmbeddingModel }
+
+$requirements = @(
+  [pscustomobject]@{ Name = $ChatDeploymentName; Model = $ChatModel; Capacity = $ChatCapacity; Sku = $DeploymentSku }
+  [pscustomobject]@{ Name = $DetectDeploymentName; Model = $DetectModel; Capacity = $DetectCapacity; Sku = $DeploymentSku }
+  [pscustomobject]@{ Name = $EmbeddingDeploymentName; Model = $EmbeddingModel; Capacity = $EmbeddingCapacity; Sku = $EmbeddingDeploymentSku }
+)
+if (@($requirements.Name | Sort-Object -Unique).Count -ne $requirements.Count) {
+  throw 'Chat, detection, and embedding deployment names must be distinct.'
+}
+foreach ($name in $requirements.Name) {
+  if ($name -notmatch '^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$') { throw "Invalid deployment name '$name'." }
+}
+$deployments = @()
+if ($openAi) {
+  $deployments = @(Invoke-AzJson cognitiveservices account deployment list `
+      --resource-group $ResourceGroup --name $OpenAIAccountName)
+  if ($Location -and $Location -ne $openAi.location) {
+    throw "Existing OpenAI account is in '$($openAi.location)', not '$Location'. Use its actual location or a different account name."
+  }
+  $Location = $openAi.location
+}
+if ($speech) {
+  if ($SpeechLocation -and $SpeechLocation -ne $speech.location) {
+    throw "Existing Speech account is in '$($speech.location)', not '$SpeechLocation'."
+  }
+  $SpeechLocation = $speech.location
 }
 
-if (-not (Test-AzResource @('cognitiveservices', 'account', 'show', '--resource-group', $ResourceGroup, '--name', $OpenAIAccountName))) {
-  Write-Host "Creating Azure OpenAI account '$OpenAIAccountName'..."
-  Invoke-Az cognitiveservices account create `
-    --resource-group $ResourceGroup `
-    --name $OpenAIAccountName `
-    --location $Location `
-    --kind OpenAI `
-    --sku S0 `
-    --custom-domain $OpenAIAccountName `
-    --yes `
-    --output none `
-    --only-show-errors
-}
-
-if (-not (Test-AzResource @('cognitiveservices', 'account', 'show', '--resource-group', $ResourceGroup, '--name', $SpeechAccountName))) {
-  Write-Host "Creating Speech account '$SpeechAccountName'..."
-  Invoke-Az cognitiveservices account create `
-    --resource-group $ResourceGroup `
-    --name $SpeechAccountName `
-    --location $Location `
-    --kind SpeechServices `
-    --sku S0 `
-    --custom-domain $SpeechAccountName `
-    --yes `
-    --output none `
-    --only-show-errors
-}
-
-Deploy-Model -DeploymentName 'gpt-4.1-mini' -ModelName 'gpt-4.1-mini' -Capacity $ChatCapacity
-Deploy-Model -DeploymentName 'gpt-4.1-nano' -ModelName 'gpt-4.1-nano' -Capacity $DetectCapacity
-Deploy-Model -DeploymentName 'text-embedding-3-small' -ModelName 'text-embedding-3-small' -Capacity $EmbeddingCapacity
-
-$openAiId = (Invoke-Az cognitiveservices account show --resource-group $ResourceGroup --name $OpenAIAccountName --query id --output tsv --only-show-errors).Trim()
-$openAiEndpoint = (Invoke-Az cognitiveservices account show --resource-group $ResourceGroup --name $OpenAIAccountName --query properties.endpoint --output tsv --only-show-errors).Trim()
-$speechId = (Invoke-Az cognitiveservices account show --resource-group $ResourceGroup --name $SpeechAccountName --query id --output tsv --only-show-errors).Trim()
-
-$openAiKey = ''
-$speechKey = ''
-if ($Authentication -eq 'EntraId') {
-  $principalId = (Invoke-Az ad signed-in-user show --query id --output tsv --only-show-errors).Trim()
-  Write-Host 'Assigning data-plane roles to the signed-in user...'
-  Grant-RoleIfMissing -PrincipalId $principalId -Role 'Cognitive Services OpenAI User' -Scope $openAiId
-  Grant-RoleIfMissing -PrincipalId $principalId -Role 'Cognitive Services Speech User' -Scope $speechId
+$openAiRegions = @()
+if (-not $Location) { $openAiRegions = @(Get-ServiceLocation OpenAI) }
+$speechRegions = @()
+if (-not $speech) { $speechRegions = @(Get-ServiceLocation SpeechServices) }
+$candidateRegions = @()
+if ($Location) {
+  $candidateRegions = @($Location)
 }
 else {
-  $openAiKey = (Invoke-Az cognitiveservices account keys list --resource-group $ResourceGroup --name $OpenAIAccountName --query key1 --output tsv --only-show-errors).Trim()
-  $speechKey = (Invoke-Az cognitiveservices account keys list --resource-group $ResourceGroup --name $SpeechAccountName --query key1 --output tsv --only-show-errors).Trim()
+  if ($group -and $group.location -in $openAiRegions) { $candidateRegions += $group.location }
+  $candidateRegions += $openAiRegions
+  $candidateRegions = @($candidateRegions | Select-Object -Unique)
+  if (-not $speech -and -not $SpeechLocation) {
+    $candidateRegions = @($candidateRegions | Where-Object { $_ -in $speechRegions })
+  }
 }
+if (-not $speech -and $SpeechLocation -and $SpeechLocation -notin $speechRegions) {
+  throw "Speech S0 is not available in '$SpeechLocation' for this subscription."
+}
+$plan = $null
+foreach ($region in $candidateRegions) {
+  if (-not $speech -and -not $SpeechLocation -and $region -notin $speechRegions) { continue }
+  Write-Host "Checking model availability and quota in '$region'..."
+  $candidate = Get-DeploymentPlan -Region $region
+  if ($candidate.Ready) { $plan = $candidate; $Location = $region; break }
+  Write-Host "Skipping '$region': $($candidate.Reason)"
+}
+if (-not $plan) {
+  throw "No suitable region was found for the requested models, SKUs, and quota. Use -Location/-SpeechLocation or adjust the model, SKU, or capacity parameters. Inspect 'az cognitiveservices usage list --location <region>' for quota."
+}
+if (-not $SpeechLocation) { $SpeechLocation = $Location }
+Write-Host "OpenAI region: $Location; Speech region: $SpeechLocation"
 
-$envPath = Join-Path $repoRoot '.env'
-$envContent = @"
-# Generated by scripts/provision-azure.ps1. Do not commit this file.
+if (-not $group) {
+  Write-Host "Creating resource group '$ResourceGroup'..."
+  $group = Invoke-AzJson group create --name $ResourceGroup --location $Location
+}
+$openAi = Initialize-AiAccount -Name $OpenAIAccountName -Kind OpenAI -Region $Location -Existing $openAi
+$speech = Initialize-AiAccount -Name $SpeechAccountName -Kind SpeechServices -Region $SpeechLocation -Existing $speech
+foreach ($item in $plan.Items) {
+  if ($item.Existing) {
+    Write-Host "Deployment '$($item.Requirement.Name)' already exists and matches the requested model."
+    continue
+  }
+  Write-Host "Deploying '$($item.Requirement.Name)': $($item.Requirement.Model) version $($item.Version), $($item.Sku), capacity $($item.Capacity)..."
+  $deployment = Invoke-AzJson cognitiveservices account deployment create `
+    --resource-group $ResourceGroup --name $OpenAIAccountName `
+    --deployment-name $item.Requirement.Name --model-name $item.Requirement.Model `
+    --model-version $item.Version --model-format OpenAI --sku-name $item.Sku --sku-capacity $item.Capacity
+  if ($deployment.properties.provisioningState -ne 'Succeeded') {
+    throw "Deployment '$($item.Requirement.Name)' is not ready: $($deployment.properties.provisioningState)."
+  }
+}
+Write-Host 'Assigning data-plane access. Owner, User Access Administrator, or equivalent role-assignment permission is required.'
+Grant-RoleIfMissing -Role 'Cognitive Services OpenAI User' -Scope $openAi.id
+Grant-RoleIfMissing -Role 'Cognitive Services Speech User' -Scope $speech.id
+
+$openAiEndpoint = $openAi.properties.endpoint
+if (-not $openAiEndpoint) { throw "Azure returned no endpoint for '$OpenAIAccountName'." }
+$azureEnv = @"
 AZURE_OPENAI_ENDPOINT=$openAiEndpoint
-AZURE_OPENAI_API_KEY=$openAiKey
+AZURE_OPENAI_API_KEY=
 AZURE_OPENAI_API_VERSION=2024-10-21
-AZURE_OPENAI_CHAT_DEPLOYMENT=gpt-4.1-mini
-AZURE_OPENAI_DETECT_DEPLOYMENT=gpt-4.1-nano
-AZURE_OPENAI_EMBEDDING_DEPLOYMENT=text-embedding-3-small
+AZURE_OPENAI_CHAT_DEPLOYMENT=$ChatDeploymentName
+AZURE_OPENAI_DETECT_DEPLOYMENT=$DetectDeploymentName
+AZURE_OPENAI_EMBEDDING_DEPLOYMENT=$EmbeddingDeploymentName
 
-AZURE_SPEECH_KEY=$speechKey
-AZURE_SPEECH_REGION=$Location
-AZURE_SPEECH_RESOURCE_ID=$speechId
+AZURE_SPEECH_KEY=
+AZURE_SPEECH_REGION=$($speech.location)
+AZURE_SPEECH_RESOURCE_ID=$($speech.id)
+"@
+$envContent = @"
+# Generated by scripts/provision-azure.ps1. Authentication: Microsoft Entra ID only.
+# Keep both key variables empty, including when merging into an existing .env.
+$azureEnv
 
 PORT=3978
 ALLOWED_ORIGINS=http://localhost:5173
 VITE_API_BASE=
 "@
-
-if (Test-Path $envPath) {
-  $generatedPath = Join-Path $repoRoot '.env.generated'
-  Set-Content -Path $generatedPath -Value $envContent -Encoding utf8NoBOM
-  Write-Warning ".env already exists and was not overwritten. New configuration was written to '$generatedPath'."
+$envPath = Join-Path $repoRoot '.env'
+$outputPath = $envPath
+if (Test-Path -LiteralPath $envPath) {
+  $outputPath = Join-Path $repoRoot '.env.generated'
+  Write-Warning ".env already exists and was not overwritten. Merge the Azure settings from '$outputPath' into it."
 }
-else {
-  Set-Content -Path $envPath -Value $envContent -Encoding utf8NoBOM
-  Write-Host "Created '$envPath'."
-}
+[IO.File]::WriteAllText($outputPath, "$envContent`n", (New-Object Text.UTF8Encoding($false)))
 
 Write-Host ''
-Write-Host 'Azure resources and model deployments are ready.'
+Write-Host 'Azure resources and model deployments are provisioned for Entra ID.'
 Write-Host "Resource group: $ResourceGroup"
-Write-Host "Azure OpenAI:  $OpenAIAccountName"
-Write-Host "Azure Speech:  $SpeechAccountName"
-Write-Host 'Next: install dependencies, then run the server and client as described in README.md.'
+Write-Host "Azure OpenAI:  $($openAi.id)"
+Write-Host "Azure Speech:  $($speech.id)"
+Write-Host "Configuration saved to '$outputPath'."
+Write-Host ''
+Write-Host "Add or replace these values in '$envPath' (leave both key fields empty):"
+Write-Host $azureEnv
+Write-Host ''
+Write-Host 'Role assignments can take several minutes to propagate. Keep az login active for the local backend.'
+Write-Host 'Next: install dependencies and start the server/client as described in README.md.'
